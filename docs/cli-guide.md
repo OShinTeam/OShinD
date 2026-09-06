@@ -94,7 +94,7 @@ oshind dl sftp://example.com/file.zip -u root --skip-tls-verify
 
 | 参数 | 简写 | 说明 | 默认值 |
 |------|------|------|--------|
-| `--output` | `-o` | 输出路径 | 当前目录 |
+| `--output` | `-o` | 输出路径（目录不存在时自动创建） | 当前目录 |
 | `--connections` | `-c` | 并发连接数 (1-64) | 4 |
 | `--chunk-size` | `-s` | 分片大小 | 8m |
 | `--timeout` | `-t` | 请求超时 | 30s |

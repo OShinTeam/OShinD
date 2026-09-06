@@ -109,6 +109,15 @@ func Probe(rawURL string, config *types.DownloadConfig) (*types.FileMetadata, er
 		metadata.Checksum = csValue
 	}
 
+	// HTML 中转页/防盗链提示页（200 忽略 Range）的 Content-Length 是页面大小而非文件大小，
+	// 若当作文件大小切分片会产出截断文件：大小置为未知，回退单片下载到 EOF。
+	// 置于校验和检测之后，一并清除从页面头误提取的校验值
+	if resp.StatusCode == http.StatusOK && strings.HasPrefix(strings.ToLower(metadata.ContentType), "text/html") {
+		metadata.Size = -1
+		metadata.SupportResume = false
+		metadata.ChecksumType, metadata.Checksum = "", ""
+	}
+
 	if cd := resp.Header.Get("Content-Disposition"); cd != "" {
 		if name := ParseContentDisposition(cd); name != "" {
 			metadata.FileName = name

@@ -54,7 +54,7 @@ char* OShinD_Download(char* url, char* optionsJson)
 **optionsJson 字段**:
 ```json
 {
-  "output_dir": "./downloads",        // 输出目录（默认 "."）
+  "output_dir": "./downloads",        // 输出目录（未指定时使用用户下载目录，不存在时自动创建）
   "connections": 4,                    // 最大并发连接数（默认 4，范围 1-64）
   "chunk_size": 8388608,              // 分片大小（字节，默认 8MB）
   "timeout": 30,                      // 请求超时（秒，默认 30）
@@ -70,6 +70,10 @@ char* OShinD_Download(char* url, char* optionsJson)
 ```
 
 **返回值**: 任务 ID（字符串，用于后续操作），失败返回空字符串 `""`
+
+> 输出目录会在提交前自动创建。若目录创建失败（如父路径是文件、权限不足），
+> 仍会返回任务 ID，任务状态为 `FAILED`，可通过 `OShinD_GetTaskStatus` 的
+> `error` 字段获取具体原因。
 
 **示例**:
 ```c
@@ -119,9 +123,14 @@ char* OShinD_GetTaskStatus(char* taskID)
   "chunk_size": 8388608,
   "temp_size": 540000000,
   "created_at": "2026-05-13T12:00:00Z",
-  "updated_at": "2026-05-13T12:01:30Z"
+  "updated_at": "2026-05-13T12:01:30Z",
+  "error": "failed to create output dir \"./downloads\": permission denied"
 }
 ```
+
+> `error` 仅在任务失败时出现（`omitempty`），成功时为缺省字段。
+> 失败原因包括：输出目录不可创建、探测失败、校验失败、全部分片失败等。
+> 分片级错误见 `chunks[].error`。
 
 **状态值**:
 - `PENDING` - 待开始

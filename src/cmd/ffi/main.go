@@ -72,6 +72,7 @@ type TaskStatusJSON struct {
 	TempSize        int64             `json:"temp_size"`        // temp 文件已写入大小（字节）
 	CreatedAt       string            `json:"created_at"`       // 创建时间
 	UpdatedAt       string            `json:"updated_at"`       // 更新时间
+	Error           string            `json:"error,omitempty"`  // 任务级错误信息（失败时非空）
 }
 
 // initEngine 初始化下载引擎（单例）
@@ -149,7 +150,7 @@ func buildTaskStatusJSON(task *types.DownloadTask) TaskStatusJSON {
 		progressPct = float64(task.Progress.GetDownloaded()) / float64(task.Metadata.Size) * 100
 	}
 
-	return TaskStatusJSON{
+	status := TaskStatusJSON{
 		ID:              task.ID,
 		URL:             task.URL,
 		FileName:        task.FileName,
@@ -170,6 +171,12 @@ func buildTaskStatusJSON(task *types.DownloadTask) TaskStatusJSON {
 		CreatedAt:       task.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:       task.UpdatedAt.Format(time.RFC3339),
 	}
+
+	if taskErr := task.GetError(); taskErr != nil {
+		status.Error = taskErr.Error()
+	}
+
+	return status
 }
 
 // getTaskMaxConnections 获取任务最大并发连接数
@@ -227,6 +234,8 @@ func OShinD_Version() *C.char {
 //   - skip_tls_verify: 跳过 TLS 验证
 //
 // 返回 task_id，失败返回空字符串
+// 输出目录不可创建等提交期失败：仍返回 task_id，任务状态为 FAILED，
+// 可通过 OShinD_GetTaskStatus 的 error 字段获取原因
 //
 //export OShinD_Download
 func OShinD_Download(url *C.char, optionsJson *C.char) *C.char {
@@ -234,21 +243,34 @@ func OShinD_Download(url *C.char, optionsJson *C.char) *C.char {
 
 	config := types.DefaultConfig()
 
+	outputDirSpecified := false
 	if optionsJson != nil {
 		optsStr := C.GoString(optionsJson)
 		if optsStr != "" {
 			var opts DownloadOptionsJSON
 			if err := json.Unmarshal([]byte(optsStr), &opts); err == nil {
+				outputDirSpecified = opts.OutputDir != ""
 				applyDownloadOptions(config, &opts)
 			}
 		}
 	}
 
+	// FFI 宿主进程（iOS/Android 等）CWD 不可控且常为只读，
+	// 未显式指定 output_dir 时回落到用户下载目录，避免下载到不可写路径
+	if !outputDirSpecified {
+		if home, homeErr := os.UserHomeDir(); homeErr == nil && home != "" {
+			config.OutputDir = filepath.Join(home, "Downloads")
+		}
+	}
+
 	e := initEngine()
 	taskID, err := e.SubmitDownload(goURL, config, nil)
-	if err != nil {
+	if err != nil && taskID == "" {
+		// 提交阶段无任务产生（如协议不支持），无状态可查询
 		return C.CString("")
 	}
+	// 提交期失败（如输出目录无法创建）也会返回 task_id，
+	// 调用方通过 GetTaskStatus 的 error 字段读取失败原因
 	return C.CString(taskID)
 }
 
