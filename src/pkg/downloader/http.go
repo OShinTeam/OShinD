@@ -211,6 +211,11 @@ func (d *HTTPDownloader) nextURL() string {
 
 // Download 执行 HTTP/HTTPS 下载
 func (d *HTTPDownloader) Download(ctx context.Context, task *types.DownloadTask) error {
+	// 输出目录兜底校验：不存在则创建，避免创建临时文件时才失败
+	if err := EnsureOutputDir(task.Config.OutputDir); err != nil {
+		return err
+	}
+
 	outputPath := d.getOutputPath(task)
 	oshinPath := GetOShinStatePath(outputPath)
 	tempPath := GetTempPath(outputPath)
@@ -419,18 +424,18 @@ func (d *HTTPDownloader) Download(ctx context.Context, task *types.DownloadTask)
 
 	// 检查是否被中断（Ctrl+C），中断时保留 .oshin 状态文件用于续传
 	if downloadCtx.Err() != nil {
-		// 如果是用户主动暂停，状态已设为 PAUSED，不需要再改为 FAILED
-		if task.GetStatus() != types.TaskStatusPaused {
-			task.SetStatus(types.TaskStatusFailed)
-		}
+		// Fail 内部跳过 PAUSED（用户主动暂停优先于失败），无需此处判断
+		task.Fail(downloadCtx.Err())
 		return downloadCtx.Err()
 	}
 
-	// 检查是否所有分片都失败
+	// 存在失败分片时禁止重命名，避免产出带空洞的不完整文件
+	// （.oshin 断点状态已保存，可通过 resume 恢复）
 	failedCount := task.Progress.GetFailedChunks()
-	if failedCount == int32(chunkCount) {
-		task.SetStatus(types.TaskStatusFailed)
-		return fmt.Errorf("all %d chunks failed", chunkCount)
+	if failedCount > 0 {
+		chunkErr := fmt.Errorf("%d of %d chunks failed", failedCount, chunkCount)
+		task.Fail(chunkErr)
+		return chunkErr
 	}
 
 	// 下载完成，重命名临时文件

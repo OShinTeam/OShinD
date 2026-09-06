@@ -370,6 +370,7 @@ type DownloadTask struct {
 	UpdatedAt   time.Time       // 更新时间
 	MultiSource bool            // 是否多来源下载
 	Verify      *VerifyResult   // 文件校验结果（下载完成后填充）
+	Error       error           // 任务级错误信息（失败时填充，供状态查询/FFI 暴露）
 }
 
 // NewDownloadTask 创建新的下载任务
@@ -403,6 +404,28 @@ func (t *DownloadTask) SetStatus(status TaskStatus) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.Status = status
+	t.UpdatedAt = time.Now()
+}
+
+// GetError 获取任务级错误信息（线程安全），成功时为 nil
+func (t *DownloadTask) GetError() error {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.Error
+}
+
+// Fail 将任务原子地置为 FAILED 并记录错误信息
+// 判断、记录、置状态在同一把锁内完成，避免与 PauseTask 的 TOCTOU 竞态，
+// 也避免轮询方读到 "FAILED 但 error 为 nil" 的瞬态
+// 已处于 PAUSED 时为 no-op（用户主动中断优先于失败）
+func (t *DownloadTask) Fail(err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.Status == TaskStatusPaused {
+		return
+	}
+	t.Error = err
+	t.Status = TaskStatusFailed
 	t.UpdatedAt = time.Now()
 }
 

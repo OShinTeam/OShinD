@@ -3,6 +3,7 @@ package downloader
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 
@@ -65,15 +66,21 @@ func (e *Engine) Download(ctx context.Context, rawURL string, config *types.Down
 		onReady(task)
 	}
 
+	// 提交前校验输出目录：不存在则自动创建，避免下载阶段因路径不存在而直接失败
+	if dirErr := EnsureOutputDir(config.OutputDir); dirErr != nil {
+		e.failTask(task, dirErr)
+		return task, dirErr
+	}
+
 	// 根据协议执行下载
 	switch protocol {
 	case types.ProtocolHTTP, types.ProtocolHTTPS:
 		task.SetStatus(types.TaskStatusProbing)
 		metadata, err := Probe(rawURL, config)
 		if err != nil {
-			task.SetStatus(types.TaskStatusFailed)
-			e.cleanupCancelFunc(task.ID)
-			return task, fmt.Errorf("probe failed: %w", err)
+			probeErr := fmt.Errorf("probe failed: %w", err)
+			e.failTask(task, probeErr)
+			return task, probeErr
 		}
 		task.Metadata = metadata
 
@@ -90,8 +97,7 @@ func (e *Engine) Download(ctx context.Context, rawURL string, config *types.Down
 		task.SetStatus(types.TaskStatusVerifying)
 		skip, checkedPath, verifyResult, checkErr := checkExistingFile(outputPath, task)
 		if checkErr != nil {
-			task.SetStatus(types.TaskStatusFailed)
-			e.cleanupCancelFunc(task.ID)
+			e.failTask(task, checkErr)
 			return task, checkErr
 		}
 		if skip {
@@ -107,26 +113,28 @@ func (e *Engine) Download(ctx context.Context, rawURL string, config *types.Down
 		}
 
 		if err := e.httpDownloader.Download(taskCtx, task); err != nil {
-			task.SetStatus(types.TaskStatusFailed)
-			e.cleanupCancelFunc(task.ID)
-			return task, fmt.Errorf("HTTP download failed: %w", err)
+			dlErr := fmt.Errorf("HTTP download failed: %w", err)
+			e.failTask(task, dlErr)
+			return task, dlErr
 		}
 	case types.ProtocolFTP:
 		if err := e.ftpDownloader.Download(taskCtx, task); err != nil {
-			task.SetStatus(types.TaskStatusFailed)
-			e.cleanupCancelFunc(task.ID)
-			return task, fmt.Errorf("FTP download failed: %w", err)
+			dlErr := fmt.Errorf("FTP download failed: %w", err)
+			e.failTask(task, dlErr)
+			return task, dlErr
 		}
 
 	case types.ProtocolSFTP:
 		if err := e.sftpDownloader.Download(taskCtx, task); err != nil {
-			task.SetStatus(types.TaskStatusFailed)
-			e.cleanupCancelFunc(task.ID)
-			return task, fmt.Errorf("SFTP download failed: %w", err)
+			dlErr := fmt.Errorf("SFTP download failed: %w", err)
+			e.failTask(task, dlErr)
+			return task, dlErr
 		}
 
 	default:
-		return nil, fmt.Errorf("unsupported protocol: %v", protocol)
+		protoErr := fmt.Errorf("unsupported protocol: %v", protocol)
+		e.failTask(task, protoErr)
+		return task, protoErr
 	}
 
 	task.SetStatus(types.TaskStatusVerifying)
@@ -134,9 +142,9 @@ func (e *Engine) Download(ctx context.Context, rawURL string, config *types.Down
 	verifyResult := VerifyTask(task, outputPath)
 	task.Verify = verifyResult
 	if !verifyResult.Passed && !verifyResult.Skipped {
-		task.SetStatus(types.TaskStatusFailed)
-		e.cleanupCancelFunc(task.ID)
-		return task, fmt.Errorf("checksum verification failed: expected %s, got %s", verifyResult.Expected, verifyResult.Actual)
+		verifyErr := fmt.Errorf("checksum verification failed: expected %s, got %s", verifyResult.Expected, verifyResult.Actual)
+		e.failTask(task, verifyErr)
+		return task, verifyErr
 	}
 
 	task.OutputPath = outputPath
@@ -149,6 +157,8 @@ func (e *Engine) Download(ctx context.Context, rawURL string, config *types.Down
 }
 
 // SubmitDownload 异步提交下载任务
+// 提交阶段即校验输出目录：失败时任务被置为 FAILED 并携带 error，
+// 同时返回任务 ID，调用方仍可通过 GetTask/状态查询获取失败原因
 func (e *Engine) SubmitDownload(rawURL string, config *types.DownloadConfig, onReady func(*types.DownloadTask)) (string, error) {
 	if config == nil {
 		config = types.DefaultConfig()
@@ -176,6 +186,12 @@ func (e *Engine) SubmitDownload(rawURL string, config *types.DownloadConfig, onR
 		onReady(task)
 	}
 
+	// 提交前校验输出目录：不存在则自动创建
+	if dirErr := EnsureOutputDir(config.OutputDir); dirErr != nil {
+		e.failTask(task, dirErr)
+		return task.ID, dirErr
+	}
+
 	go func() {
 		// 根据协议执行下载
 		switch protocol {
@@ -183,8 +199,7 @@ func (e *Engine) SubmitDownload(rawURL string, config *types.DownloadConfig, onR
 			task.SetStatus(types.TaskStatusProbing)
 			metadata, probeErr := Probe(rawURL, config)
 			if probeErr != nil {
-				task.SetStatus(types.TaskStatusFailed)
-				e.cleanupCancelFunc(task.ID)
+				e.failTask(task, fmt.Errorf("probe failed: %w", probeErr))
 				return
 			}
 			task.Metadata = metadata
@@ -204,8 +219,7 @@ func (e *Engine) SubmitDownload(rawURL string, config *types.DownloadConfig, onR
 				task.SetStatus(types.TaskStatusVerifying)
 				skip, checkedPath, verifyResult, checkErr := checkExistingFile(outputPath, task)
 				if checkErr != nil {
-					task.SetStatus(types.TaskStatusFailed)
-					e.cleanupCancelFunc(task.ID)
+					e.failTask(task, checkErr)
 					return
 				}
 				if skip {
@@ -222,28 +236,19 @@ func (e *Engine) SubmitDownload(rawURL string, config *types.DownloadConfig, onR
 			}
 
 			if dlErr := e.httpDownloader.Download(taskCtx, task); dlErr != nil {
-				if task.GetStatus() != types.TaskStatusPaused {
-					task.SetStatus(types.TaskStatusFailed)
-				}
-				e.cleanupCancelFunc(task.ID)
+				e.failTask(task, fmt.Errorf("HTTP download failed: %w", dlErr))
 				return
 			}
 
 		case types.ProtocolFTP:
 			if dlErr := e.ftpDownloader.Download(taskCtx, task); dlErr != nil {
-				if task.GetStatus() != types.TaskStatusPaused {
-					task.SetStatus(types.TaskStatusFailed)
-				}
-				e.cleanupCancelFunc(task.ID)
+				e.failTask(task, fmt.Errorf("FTP download failed: %w", dlErr))
 				return
 			}
 
 		case types.ProtocolSFTP:
 			if dlErr := e.sftpDownloader.Download(taskCtx, task); dlErr != nil {
-				if task.GetStatus() != types.TaskStatusPaused {
-					task.SetStatus(types.TaskStatusFailed)
-				}
-				e.cleanupCancelFunc(task.ID)
+				e.failTask(task, fmt.Errorf("SFTP download failed: %w", dlErr))
 				return
 			}
 		}
@@ -253,8 +258,7 @@ func (e *Engine) SubmitDownload(rawURL string, config *types.DownloadConfig, onR
 		verifyResult := VerifyTask(task, outputPath)
 		task.Verify = verifyResult
 		if !verifyResult.Passed && !verifyResult.Skipped {
-			task.SetStatus(types.TaskStatusFailed)
-			e.cleanupCancelFunc(task.ID)
+			e.failTask(task, fmt.Errorf("checksum verification failed: expected %s, got %s", verifyResult.Expected, verifyResult.Actual))
 			return
 		}
 
@@ -369,11 +373,46 @@ func (e *Engine) CancelTask(id string) error {
 	return nil
 }
 
-// cleanupCancelFunc 任务完成后释放取消函数引用
+// cleanupCancelFunc 任务结束后释放取消函数引用
+// 先 cancel 再删除，避免任务提前失败时遗漏 context 资源
 func (e *Engine) cleanupCancelFunc(id string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	delete(e.cancelFuncs, id)
+	if cancel, ok := e.cancelFuncs[id]; ok {
+		cancel()
+		delete(e.cancelFuncs, id)
+	}
+}
+
+// failTask 统一处理任务失败：原子记录错误并置 FAILED，再释放取消函数
+// PAUSED（用户主动中断）由 DownloadTask.Fail 内部判定，不记为失败错误
+func (e *Engine) failTask(task *types.DownloadTask, err error) {
+	task.Fail(err)
+	e.cleanupCancelFunc(task.ID)
+}
+
+// EnsureOutputDir 校验输出目录：不存在则递归创建，存在但不是目录则报错
+// 在下载开始前调用，避免任务因输出路径缺失而立即失败
+func EnsureOutputDir(dir string) error {
+	if dir == "" || dir == "." {
+		return nil
+	}
+
+	info, err := os.Stat(dir)
+	switch {
+	case err == nil:
+		if !info.IsDir() {
+			return fmt.Errorf("output path is not a directory: %s", dir)
+		}
+		return nil
+	case os.IsNotExist(err):
+		if mkErr := os.MkdirAll(dir, 0755); mkErr != nil {
+			return fmt.Errorf("failed to create output dir %q: %w", dir, mkErr)
+		}
+		return nil
+	default:
+		return fmt.Errorf("failed to access output dir %q: %w", dir, err)
+	}
 }
 
 // getOutputPath 获取输出文件路径

@@ -67,6 +67,11 @@ func (d *FTPDownloader) Download(ctx context.Context, task *types.DownloadTask) 
 	task.Metadata.Size = size
 	task.Metadata.SupportResume = true // FTP 支持断点续传
 
+	// 输出目录兜底校验：不存在则创建，避免创建输出文件时才失败
+	if err := EnsureOutputDir(task.Config.OutputDir); err != nil {
+		return err
+	}
+
 	outputPath := d.getOutputPath(task)
 	oshinPath := GetOShinStatePath(outputPath)
 	tempPath := GetTempPath(outputPath)
