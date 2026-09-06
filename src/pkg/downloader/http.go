@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -586,8 +587,42 @@ func (d *HTTPDownloader) downloadChunk(ctx context.Context, task *types.Download
 			continue
 		}
 
+		// 服务器忽略 Range 返回 200 且请求起点非 0 时，数据无法对齐写入，
+		// 继续重试无意义，直接失败（错误信息经任务 error 字段透出）
+		if resp.StatusCode == http.StatusOK && startPos > 0 {
+			resp.Body.Close()
+			task.UpdateChunkStatus(chunk.Index, types.ChunkStatusFailed)
+			return fmt.Errorf("server ignored range request at offset %d", startPos)
+		}
+
+		// 206 校验 Content-Range 起始偏移：防止中间层错位返回导致写入错误位置
+		if resp.StatusCode == http.StatusPartialContent && startPos > 0 {
+			if cr := resp.Header.Get("Content-Range"); cr != "" {
+				// 格式 bytes S-E/T
+				if dash := strings.IndexByte(cr, '-'); dash > 0 {
+					seg := cr[:dash]
+					if sp := strings.LastIndexByte(seg, ' '); sp >= 0 {
+						seg = seg[sp+1:]
+					}
+					if s, perr := strconv.ParseInt(strings.TrimSpace(seg), 10, 64); perr == nil && s != startPos {
+						resp.Body.Close()
+						lastErr = fmt.Errorf("content-range misaligned: got start %d, want %d", s, startPos)
+						continue
+					}
+				}
+			}
+		}
+
+		// 206 响应限定读取跨度：服务器提前 EOF 或超额发送都不会静默破坏分片完整性
+		body := io.Reader(resp.Body)
+		if resp.StatusCode == http.StatusPartialContent && chunk.End >= 0 {
+			if remaining := chunk.End - (chunk.Start + chunk.LocalOffset) + 1; remaining > 0 {
+				body = io.LimitReader(resp.Body, remaining)
+			}
+		}
+
 		// 下载数据
-		err = d.readChunkData(ctx, task, chunk, resp.Body, tempFile)
+		err = d.readChunkData(ctx, task, chunk, body, tempFile)
 		resp.Body.Close()
 
 		if err == nil {
@@ -631,6 +666,16 @@ func (d *HTTPDownloader) readChunkData(ctx context.Context, task *types.Download
 				break
 			}
 			return fmt.Errorf("failed to read chunk: %w", readErr)
+		}
+	}
+
+	// 分片完整性校验：EOF 时已收字节数必须达到分片跨度（跨重试累计）。
+	// 防止 CDN 单请求配额截断/连接中断等产生的截断响应被静默标记完成，
+	// 产出带空洞的文件；不足部分经 downloadChunk 重试从断点续传
+	if chunk.End >= 0 {
+		if span := chunk.End - chunk.Start + 1; chunk.Downloaded < span {
+			task.UpdateChunkStatus(chunk.Index, types.ChunkStatusFailed)
+			return fmt.Errorf("chunk %d truncated: got %d of %d bytes", chunk.Index, chunk.Downloaded, span)
 		}
 	}
 
