@@ -244,6 +244,13 @@ func (p *ProgressInfo) AddDownloaded(n int64) {
 	p.Downloaded += n
 }
 
+// SetDownloaded 重置已下载字节（降级单线程重下时清零重计）
+func (p *ProgressInfo) SetDownloaded(n int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.Downloaded = n
+}
+
 // GetDownloaded 获取已下载字节
 func (p *ProgressInfo) GetDownloaded() int64 {
 	p.mu.RLock()
@@ -314,6 +321,13 @@ func (p *ProgressInfo) GetFailedChunks() int32 {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.FailedChunks
+}
+
+// SetFailedChunks 设置失败分块数（任务级重试重算时使用，避免计数虚高）
+func (p *ProgressInfo) SetFailedChunks(n int32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.FailedChunks = n
 }
 
 // IncFailedChunks 增加失败分块数
@@ -427,6 +441,26 @@ func (t *DownloadTask) Fail(err error) {
 	t.Error = err
 	t.Status = TaskStatusFailed
 	t.UpdatedAt = time.Now()
+}
+
+// SetChunkError 记录分片最后一次错误（err 为 nil 表示清除）
+// 持任务锁写入，与 GetChunkSnapshots 的读取互斥，避免数据竞争
+func (t *DownloadTask) SetChunkError(index int, err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if index >= 0 && index < len(t.Chunks) {
+		t.Chunks[index].Error = err
+	}
+}
+
+// IncChunkRetry 增加分片重排队计数
+// 持任务锁写入，与 GetChunkSnapshots 的读取互斥，避免数据竞争
+func (t *DownloadTask) IncChunkRetry(index int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if index >= 0 && index < len(t.Chunks) {
+		t.Chunks[index].RetryCount++
+	}
 }
 
 // GetChunk 获取指定分片
