@@ -3,6 +3,7 @@ package downloader
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -107,25 +108,94 @@ func findAvailablePath(outputPath string) string {
 	}
 }
 
-// isPermanentFailure 判断是否为永久性失败（服务器限制连接数）
-func isPermanentFailure(err error) bool {
-	if err == nil {
-		return false
+// downloadSingleStream 降级为单线程不分片整文件下载
+// 场景：服务器不支持 Range（返回 200 或 Content-Range 错位），多分片下载必然失败
+// 复用已打开的 tempFile（Windows 不允许对同一路径重复打开写入），清零后从 0 顺序写入
+func (d *HTTPDownloader) downloadSingleStream(ctx context.Context, task *types.DownloadTask, tempFile *os.File) error {
+	// 已下载的分片数据作废：截断为 0 重新开始
+	if err := tempFile.Truncate(0); err != nil {
+		return fmt.Errorf("failed to truncate temp file for single-stream fallback: %w", err)
 	}
-	errStr := err.Error()
-	// 403 Forbidden
-	if strings.Contains(errStr, "forbidden") || strings.Contains(errStr, "403") {
-		return true
+	if _, err := tempFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to seek temp file: %w", err)
 	}
-	// 连接被拒绝
-	if strings.Contains(errStr, "connection refused") {
-		return true
+
+	task.SetStatus(types.TaskStatusDownloading)
+
+	// 进度清零重计：分片阶段已计入的字节数全部作废
+	task.Progress.SetDownloaded(0)
+	task.Progress.SetRemainingChunks(1)
+	task.Chunks = []*types.ChunkInfo{
+		{
+			Index:  0,
+			Start:  0,
+			End:    -1, // 表示下载到末尾
+			Status: types.ChunkStatusDownloading,
+		},
 	}
-	// Too many connections
-	if strings.Contains(errStr, "too many") {
-		return true
+
+	req, err := http.NewRequestWithContext(ctx, "GET", task.URL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
 	}
-	return false
+	// 不设置 Range 头：普通 GET 完整下载
+	req.Header.Set("User-Agent", "OShinD/1.0")
+	req.Header.Set("Content-Type", detectContentType(task.FileName))
+	applyHeaders(req, task.Config.Headers)
+
+	// 不复用 d.client（其 Timeout 覆盖整个响应体读取，大文件必然中途超时）；
+	// 使用仅限制连接建立的裸客户端，响应体读取时长不限，中断经 ctx 传递
+	transport := &http.Transport{}
+	if d.tlsConfig != nil {
+		transport.TLSClientConfig = d.tlsConfig
+	}
+	singleClient := &http.Client{
+		Transport: transport,
+		Timeout:   0,
+	}
+
+	resp, err := singleClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	buf := make([]byte, 32*1024)
+	var offset int64
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, writeErr := tempFile.WriteAt(buf[:n], offset); writeErr != nil {
+				return fmt.Errorf("failed to write: %w", writeErr)
+			}
+			offset += int64(n)
+			task.Progress.AddDownloaded(int64(n))
+			task.Chunks[0].Downloaded = offset
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				break
+			}
+			return fmt.Errorf("failed to read: %w", readErr)
+		}
+	}
+
+	// 完整性校验：已知大小但实际接收不足视为失败
+	if task.Metadata.Size > 0 && offset < task.Metadata.Size {
+		return fmt.Errorf("truncated download: got %d of %d bytes", offset, task.Metadata.Size)
+	}
+
+	return nil
 }
 
 // HTTPDownloader HTTP/HTTPS 下载器
@@ -339,8 +409,8 @@ func (d *HTTPDownloader) Download(ctx context.Context, task *types.DownloadTask)
 		}
 	}
 
-	// 创建取消上下文（仅用于外部取消，如 Ctrl+C）
-	// 分片下载失败不取消 context，让其他 worker 继续工作
+	// 创建取消上下文（用于外部取消，如 Ctrl+C / 暂停）
+	// 普通分片失败不取消 context，让其他 worker 继续工作
 	downloadCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -358,17 +428,43 @@ func (d *HTTPDownloader) Download(ctx context.Context, task *types.DownloadTask)
 	stateSaver.Start()
 	defer stateSaver.Stop()
 
+	// 分片调度参数
+	const (
+		requeueLimit     = 2               // 单分片队尾重排上限（超过后标记 Failed，等待末尾补偿）
+		cooldownFirst    = 2 * time.Second // 线程首次连续失败 cooldown
+		cooldownSecond   = 8 * time.Second // 线程第二次连续失败 cooldown
+		staggerDelay     = 300 * time.Millisecond // worker 错峰启动间隔
+	)
+
+	// 共享 FIFO 队列：worker 按顺序领取，失败分片（未超上限）append 队尾重新消费
+	queue := make([]int, 0, len(task.Chunks))
+	for _, chunk := range task.Chunks {
+		if chunk.Status != types.ChunkStatusCompleted {
+			queue = append(queue, chunk.Index)
+		}
+	}
+	var head int // 已消费到的位置，避免频繁重建 slice
+
+	var mu sync.Mutex
 	var wg sync.WaitGroup
-	var workerFailed atomic.Bool
-	nextChunkIdx := 0
-	var idxMu sync.Mutex
+	rangeUnsupported := atomic.Bool{} // 任一 worker 遇到 Range 不支持时置位
+	threadLimited := atomic.Int32{}   // 因连续失败退役的线程数
 
 	for w := 0; w < effectiveConcurrency; w++ {
 		wg.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer wg.Done()
 			task.Progress.IncActiveThreads()
 			defer task.Progress.DecActiveThreads()
+
+			// 错峰启动：失败窗口按 worker 序号天然打散，避免整批同时撞连接上限
+			select {
+			case <-time.After(time.Duration(workerID) * staggerDelay):
+			case <-downloadCtx.Done():
+				return
+			}
+
+			consecutiveErrs := 0 // 连续失败计数（成功清零），驱动 cooldown / 退役
 
 			for {
 				select {
@@ -377,33 +473,72 @@ func (d *HTTPDownloader) Download(ctx context.Context, task *types.DownloadTask)
 				default:
 				}
 
-				idxMu.Lock()
-				if nextChunkIdx >= len(task.Chunks) {
-					idxMu.Unlock()
+				mu.Lock()
+				if head >= len(queue) {
+					mu.Unlock()
 					return
 				}
-				chunk := task.Chunks[nextChunkIdx]
-				nextChunkIdx++
-				idxMu.Unlock()
-
-				if chunk.Status == types.ChunkStatusCompleted {
-					task.Progress.SetRemainingChunks(int32(len(task.Chunks)) - int32(nextChunkIdx))
-					continue
-				}
+				chunk := task.Chunks[queue[head]]
+				head++
+				mu.Unlock()
 
 				if err := d.downloadChunk(downloadCtx, task, chunk, tempFile); err != nil {
-					if !workerFailed.Load() && isPermanentFailure(err) {
-						workerFailed.Store(true)
-					}
-					task.Progress.IncFailedChunks()
+					task.SetChunkError(chunk.Index, err)
 					stateSaver.MarkDirty()
+
+					errStr := err.Error()
+					if strings.Contains(errStr, "ignored range request") || strings.Contains(errStr, "content-range misaligned") {
+						// Range 不支持：同一 URL 所有分片都必然失败，立即降级单线程整文件下载
+						rangeUnsupported.Store(true)
+						cancel()
+						return
+					}
+
+					// 先处置分片（回队尾或标 Failed）再进入 cooldown/退役，
+					// 保证 cooldown 期间被中断时分片状态不丢失
+					consecutiveErrs++
+					if chunk.RetryCount < requeueLimit {
+						task.IncChunkRetry(chunk.Index)
+						task.UpdateChunkStatus(chunk.Index, types.ChunkStatusPending)
+						mu.Lock()
+						queue = append(queue, chunk.Index)
+						mu.Unlock()
+					} else {
+						task.UpdateChunkStatus(chunk.Index, types.ChunkStatusFailed)
+					}
+
+					switch {
+					case consecutiveErrs >= 3:
+						// 第三次连续失败：视为线程受限，本次任务中不再重启该线程
+						threadLimited.Add(1)
+						return
+					case consecutiveErrs == 2:
+						select {
+						case <-time.After(cooldownSecond):
+						case <-downloadCtx.Done():
+							return
+						}
+					default:
+						select {
+						case <-time.After(cooldownFirst):
+						case <-downloadCtx.Done():
+							return
+						}
+					}
 					continue
 				}
+
+				// 成功：清空连续失败计数
+				consecutiveErrs = 0
+				task.SetChunkError(chunk.Index, nil)
 				stateSaver.MarkDirty()
 				stateSaver.Save()
-				task.Progress.SetRemainingChunks(int32(len(task.Chunks)) - int32(nextChunkIdx))
+				mu.Lock()
+				remaining := int32(len(queue) - head)
+				mu.Unlock()
+				task.Progress.SetRemainingChunks(remaining)
 			}
-		}()
+		}(w)
 	}
 
 	// 等待所有 worker 完成（带强制超时，防止 Ctrl+C 后长时间阻塞）
@@ -421,20 +556,99 @@ func (d *HTTPDownloader) Download(ctx context.Context, task *types.DownloadTask)
 		<-done
 	}
 
+	// Range 不支持：降级为单线程不分片整文件下载（已下载分片数据作废）
+	// 使用原始 ctx：降级下载仍响应暂停/Ctrl+C
+	if rangeUnsupported.Load() {
+		if dlErr := d.downloadSingleStream(ctx, task, tempFile); dlErr != nil {
+			// 旧 .oshin 记录的是分片下载状态，对整文件下载无意义，清理避免误导 resume
+			RemoveOShinState(oshinPath)
+			// Fail 内部跳过 PAUSED（用户主动暂停优先于失败）
+			task.Fail(dlErr)
+			return dlErr
+		}
+		stateSaver.Stop()
+		// 下载完成，重命名临时文件并清理状态
+		tempFile.Close()
+		if err := os.Rename(tempPath, outputPath); err != nil {
+			return fmt.Errorf("failed to rename temp file: %w", err)
+		}
+		RemoveOShinState(oshinPath)
+		task.SetStatus(types.TaskStatusCompleted)
+		return nil
+	}
+
+	// 常规消费结束后统一收口：所有未完成（Pending/DOWNLOADING/Failed）的分片
+	// 一律标记为 Failed 进入末尾补偿。
+	// 覆盖两类滞留：① 线程全部退役时已回队尾但未被消费的 Pending 分片；
+	// ② cooldown 中断时停留在 DOWNLOADING 的分片。
+	// 若不放任其绕过失败统计，最终会 rename 出带洞文件
+	for _, chunk := range task.Chunks {
+		if chunk.Status != types.ChunkStatusCompleted {
+			task.UpdateChunkStatus(chunk.Index, types.ChunkStatusFailed)
+		}
+	}
+
+	// 末尾补偿消费：常规消费结束后（队列空或线程全部退役），串行重试所有
+	// Failed 分片各一次。此时无并发争抢、服务器连接压力最小，最大化文件完整性
+	// （补偿期间用户中断经 ctx 传递，直接跳到中断处理）
+	compensate := func() {
+		for _, chunk := range task.Chunks {
+			if downloadCtx.Err() != nil {
+				return
+			}
+			if chunk.Status != types.ChunkStatusFailed {
+				continue
+			}
+			task.UpdateChunkStatus(chunk.Index, types.ChunkStatusPending)
+			if err := d.downloadChunk(downloadCtx, task, chunk, tempFile); err != nil {
+				task.SetChunkError(chunk.Index, err)
+				task.UpdateChunkStatus(chunk.Index, types.ChunkStatusFailed)
+				stateSaver.MarkDirty()
+				continue
+			}
+			task.SetChunkError(chunk.Index, nil)
+			stateSaver.MarkDirty()
+			stateSaver.Save()
+		}
+	}
+	compensate()
+
 	stateSaver.Stop()
 
-	// 检查是否被中断（Ctrl+C），中断时保留 .oshin 状态文件用于续传
+	// 检查是否被中断（Ctrl+C / 暂停），中断时保留 .oshin 状态文件用于续传
+	// Fail 内部跳过 PAUSED（用户主动暂停优先于失败）
 	if downloadCtx.Err() != nil {
-		// Fail 内部跳过 PAUSED（用户主动暂停优先于失败），无需此处判断
 		task.Fail(downloadCtx.Err())
 		return downloadCtx.Err()
 	}
 
+	// 所有线程退役且仍有未完成分片：线程受限，任务失败
 	// 存在失败分片时禁止重命名，避免产出带空洞的不完整文件
 	// （.oshin 断点状态已保存，可通过 resume 恢复）
-	failedCount := task.Progress.GetFailedChunks()
-	if failedCount > 0 {
-		chunkErr := fmt.Errorf("%d of %d chunks failed", failedCount, chunkCount)
+	// 此时所有 worker 已结束，直接读 chunk 字段无并发风险
+	var errDetails []string
+	finalFailed := 0
+	for _, chunk := range task.Chunks {
+		if chunk.Status != types.ChunkStatusFailed {
+			continue
+		}
+		finalFailed++
+		if chunk.Error != nil && len(errDetails) < 3 {
+			errDetails = append(errDetails, fmt.Sprintf("chunk %d: %v", chunk.Index, chunk.Error))
+		}
+	}
+	task.Progress.SetFailedChunks(int32(finalFailed))
+
+	if finalFailed > 0 {
+		detail := ""
+		if len(errDetails) > 0 {
+			detail = ": " + strings.Join(errDetails, "; ")
+		}
+		msg := fmt.Sprintf("%d of %d chunks failed%s", finalFailed, len(task.Chunks), detail)
+		if int(threadLimited.Load()) >= effectiveConcurrency && finalFailed+task.GetCompletedChunkCount() < len(task.Chunks) {
+			msg = fmt.Sprintf("thread limit reached: %s", msg)
+		}
+		chunkErr := errors.New(msg)
 		task.Fail(chunkErr)
 		return chunkErr
 	}
