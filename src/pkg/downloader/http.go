@@ -108,6 +108,11 @@ func findAvailablePath(outputPath string) string {
 	}
 }
 
+// ErrRangeUnsupported 表示服务器不支持 Range 请求（Range 支持性是 URL 级全局属性，
+// 任一分片遇到即所有分片都会遇到）。经 fmt.Errorf("%w") 包装后用 errors.Is 判定，
+// 判定不依赖错误文案，文案可自由修改
+var ErrRangeUnsupported = errors.New("server does not support range requests")
+
 // downloadSingleStream 降级为单线程不分片整文件下载
 // 场景：服务器不支持 Range（返回 200 或 Content-Range 错位），多分片下载必然失败
 // 复用已打开的 tempFile（Windows 不允许对同一路径重复打开写入），清零后从 0 顺序写入
@@ -486,8 +491,7 @@ func (d *HTTPDownloader) Download(ctx context.Context, task *types.DownloadTask)
 					task.SetChunkError(chunk.Index, err)
 					stateSaver.MarkDirty()
 
-					errStr := err.Error()
-					if strings.Contains(errStr, "ignored range request") || strings.Contains(errStr, "content-range misaligned") {
+					if errors.Is(err, ErrRangeUnsupported) {
 						// Range 不支持：同一 URL 所有分片都必然失败，立即降级单线程整文件下载
 						rangeUnsupported.Store(true)
 						cancel()
@@ -806,7 +810,7 @@ func (d *HTTPDownloader) downloadChunk(ctx context.Context, task *types.Download
 		if resp.StatusCode == http.StatusOK && startPos > 0 {
 			resp.Body.Close()
 			task.UpdateChunkStatus(chunk.Index, types.ChunkStatusFailed)
-			return fmt.Errorf("server ignored range request at offset %d", startPos)
+			return fmt.Errorf("server ignored range request at offset %d: %w", startPos, ErrRangeUnsupported)
 		}
 
 		// 206 校验 Content-Range 起始偏移：防止中间层错位返回导致写入错误位置
@@ -820,7 +824,7 @@ func (d *HTTPDownloader) downloadChunk(ctx context.Context, task *types.Download
 					}
 					if s, perr := strconv.ParseInt(strings.TrimSpace(seg), 10, 64); perr == nil && s != startPos {
 						resp.Body.Close()
-						lastErr = fmt.Errorf("content-range misaligned: got start %d, want %d", s, startPos)
+						lastErr = fmt.Errorf("content-range misaligned: got start %d, want %d: %w", s, startPos, ErrRangeUnsupported)
 						continue
 					}
 				}
