@@ -83,6 +83,7 @@ var (
 	statusFailed      string
 	statusPaused      string
 	statusResuming    string
+	statusCancelled   string
 )
 
 // Progress
@@ -206,6 +207,7 @@ func initTranslations() {
 	statusFailed = T("失败", "Failed")
 	statusPaused = T("已暂停", "Paused")
 	statusResuming = T("恢复下载...", "Resuming...")
+	statusCancelled = T("已取消", "Cancelled")
 
 	// Progress
 	progressConnecting = T("连接中...", "connecting...")

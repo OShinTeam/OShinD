@@ -137,7 +137,9 @@ func (d *FTPDownloader) Download(ctx context.Context, task *types.DownloadTask) 
 	defer func() {
 		outputFile.Close()
 		// 如果任务失败，删除临时文件和状态文件
-		if task.GetStatus() != types.TaskStatusCompleted && task.GetStatus() != types.TaskStatusPaused {
+		// PAUSED / CANCELLED 是用户主动中断，断点文件需保留（用户可能稍后恢复）
+		if task.GetStatus() != types.TaskStatusCompleted && task.GetStatus() != types.TaskStatusPaused &&
+			task.GetStatus() != types.TaskStatusCancelled {
 			os.Remove(tempPath)
 			RemoveOShinState(oshinPath)
 		}

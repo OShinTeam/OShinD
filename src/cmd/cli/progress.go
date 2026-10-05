@@ -130,6 +130,8 @@ func (m progressModel) View() string {
 			statusLine = "  ⏸️ " + statusPaused
 		case types.TaskStatusResuming:
 			statusLine = "  🔄 " + statusResuming
+		case types.TaskStatusCancelled:
+			statusLine = "  🚫 " + statusCancelled
 		default:
 			statusLine = fmt.Sprintf("  %s: %s", T("状态", "Status"), m.status.String())
 		}
