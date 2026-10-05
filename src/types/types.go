@@ -88,6 +88,7 @@ const (
 	TaskStatusFailed
 	TaskStatusPaused
 	TaskStatusResuming
+	TaskStatusCancelled
 )
 
 // String 返回任务状态的字符串表示
@@ -109,6 +110,8 @@ func (s TaskStatus) String() string {
 		return "PAUSED"
 	case TaskStatusResuming:
 		return "RESUMING"
+	case TaskStatusCancelled:
+		return "CANCELLED"
 	default:
 		return "UNKNOWN"
 	}
@@ -431,11 +434,11 @@ func (t *DownloadTask) GetError() error {
 // Fail 将任务原子地置为 FAILED 并记录错误信息
 // 判断、记录、置状态在同一把锁内完成，避免与 PauseTask 的 TOCTOU 竞态，
 // 也避免轮询方读到 "FAILED 但 error 为 nil" 的瞬态
-// 已处于 PAUSED 时为 no-op（用户主动中断优先于失败）
+// 已处于 PAUSED / CANCELLED 时为 no-op（用户主动中断优先于失败）
 func (t *DownloadTask) Fail(err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.Status == TaskStatusPaused {
+	if t.Status == TaskStatusPaused || t.Status == TaskStatusCancelled {
 		return
 	}
 	t.Error = err

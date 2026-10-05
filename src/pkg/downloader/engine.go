@@ -340,6 +340,7 @@ func (e *Engine) ResumeTask(id string, onReady func(*types.DownloadTask)) (strin
 
 	status := task.GetStatus()
 	if status != types.TaskStatusPaused && status != types.TaskStatusFailed {
+		// CANCELLED 不在此列：取消是用户主动放弃，不接受恢复
 		return "", fmt.Errorf("task %s is not resumable (status: %s)", id, status)
 	}
 
@@ -362,14 +363,26 @@ func (e *Engine) ResumeTask(id string, onReady func(*types.DownloadTask)) (strin
 }
 
 // CancelTask 取消任务
+// 取消下载并将状态设置为 CANCELLED。
+// 与 PauseTask 的区别是语义：PAUSED 可恢复（保留断点），CANCELLED 是用户主动放弃，
+// 调用方不应再对其调用 ResumeTask。必须先置状态再 cancel ——
+// http.go / ftp.go / sftp.go 检测到 ctx.Done() 后会返回 ctx.Err()，
+// 若此时状态仍是 DOWNLOADING，failTask 会把它改写成 FAILED，
+// 于是「取消」在调用方看来就变成了「失败」（可能被自动重试逻辑复活）。
 func (e *Engine) CancelTask(id string) error {
 	e.mu.RLock()
 	cancel, ok := e.cancelFuncs[id]
+	task, taskOk := e.tasks[id]
 	e.mu.RUnlock()
-	if !ok {
+
+	if !ok || !taskOk {
 		return fmt.Errorf("task %s not found or already completed", id)
 	}
+
+	task.SetStatus(types.TaskStatusCancelled)
+
 	cancel()
+
 	return nil
 }
 
